@@ -3,793 +3,726 @@ import { Connection, PublicKey, VersionedTransaction } from "@solana/web3.js";
 import { getWalletKey } from "../keypairUtils.ts";
 import BigNumber from "bignumber.js";
 import { Scraper } from "agent-twitter-client";
+import * as fs from "fs";
+import * as path from "path";
+
+/*
+ * Trading cycle for the Modern Stoic agent.
+ *
+ * SAFETY: the agent runs in PAPER mode unless TRADING_MODE=live is set.
+ * In paper mode it uses real market data and real Jupiter quotes, but never
+ * signs or sends a transaction and never tweets. Fills are simulated from the
+ * quote and tracked against a virtual SOL balance (TRADING_PAPER_SOL).
+ *
+ * Settings (all optional, read through runtime.getSetting):
+ *   TRADING_MODE                    "live" to trade real funds; anything else = paper
+ *   SOLANA_RPC_URL / RPC_URL        RPC endpoint (default: public mainnet)
+ *   JUPITER_API_URL                 default https://lite-api.jup.ag/swap/v1
+ *   TRADING_OPENAI_MODEL            default gpt-4o
+ *   TRADING_TOKEN_SOURCE            "dexscreener" (default, free, no key) or "birdeye"
+ *   TRADING_MIN_PAIR_AGE_HOURS      ignore pairs younger than this (default 24, DexScreener)
+ *   TRADING_MAX_POSITION_FRACTION   max share of SOL balance per buy (default 0.2)
+ *   TRADING_MAX_BUYS_PER_CYCLE      default 2
+ *   TRADING_MIN_LIQUIDITY_USD       default 50000
+ *   TRADING_MIN_VOLUME_USD          default 100000
+ *   TRADING_SLIPPAGE_BPS            default 100
+ *   TRADING_SOL_RESERVE             SOL kept back for fees (default 0.02)
+ *   TRADING_COOLDOWN_MINUTES        minimum time between cycles (default 60)
+ *   TRADING_PAPER_SOL               starting virtual balance in paper mode (default 1)
+ *   TRADING_STATE_FILE              default data/stoic-trading-<mode>.json
+ *   TRADING_TWEETS_ENABLED          "true" to tweet trades (live mode only)
+ */
+
+const SOL_MINT = "So11111111111111111111111111111111111111112";
 
 interface IPosition {
   ticker: string;
   tokenCA: string;
-  costBasisSOL: number;
-  quantity: number;
+  costBasisSOL: number; // SOL paid per token
+  quantity: number; // tokens currently held (UI units)
+  decimals: number;
   partialSales: number;
+  openedAt: string;
 }
 
-const purchasedPositions: Record<string, IPosition> = {};
-const recentlyPurchasedTokens: Set<string> = new Set();
-let lastTweetContent: string | null = null;
+interface ITradingState {
+  mode: "paper" | "live";
+  paperSol: number;
+  positions: Record<string, IPosition>;
+  realizedPnlSol: number;
+  lastCycleAt: number;
+  lastTweetContent: string | null;
+}
+
+interface IConfig {
+  live: boolean;
+  rpcUrl: string;
+  jupiterUrl: string;
+  openAiApiKey: string;
+  openAiModel: string;
+  birdeyeApiKey: string;
+  tokenSource: "dexscreener" | "birdeye";
+  minPairAgeHours: number;
+  maxPositionFraction: number;
+  maxBuysPerCycle: number;
+  minLiquidityUsd: number;
+  minVolumeUsd: number;
+  slippageBps: number;
+  solReserve: number;
+  cooldownMs: number;
+  paperSol: number;
+  stateFile: string;
+  tweetsEnabled: boolean;
+}
+
+interface ICandidate {
+  symbol: string;
+  address: string;
+  liquidityUsd: number;
+  volume24hUsd: number;
+  priceUsd: number;
+  rank: number | null;
+}
+
+let cycleRunning = false;
 
 function sleep(ms: number) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function initializeScraper(): Promise<Scraper> {
-  const scraper = new Scraper();
-  try {
-    const isLoggedIn = await scraper.isLoggedIn();
-    if (!isLoggedIn) {
-      console.log("Not logged in. Attempting login...");
-      const username = process.env.TWITTER_USERNAME || "";
-      const password = process.env.TWITTER_PASSWORD || "";
-      const email = process.env.TWITTER_EMAIL || "";
-      if (!username || !password) {
-        throw new Error("Missing username or password in environment variables.");
-      }
-      await scraper.login(username, password, email);
-      console.log("Login successful!");
-    } else {
-      console.log("Already logged in.");
-    }
-  } catch (error) {
-    console.error("Error during scraper initialization:", error);
-    throw error;
-  }
-  return scraper;
+function numSetting(runtime: IAgentRuntime, key: string, fallback: number): number {
+  const raw = runtime.getSetting(key);
+  const n = raw === undefined || raw === null || raw === "" ? NaN : Number(raw);
+  return Number.isFinite(n) ? n : fallback;
 }
 
-async function hasSufficientBalance(
-  runtime: IAgentRuntime,
-  apiKey: string,
-  walletAddress: string
-): Promise<boolean> {
-  const connection = new Connection("https://api.mainnet-beta.solana.com");
-  const solBalanceLamports = await connection.getBalance(new PublicKey(walletAddress));
-  const solBalance = solBalanceLamports / 1e9;
-  console.log(`Wallet SOL Balance: ${solBalance.toFixed(4)} SOL`);
-
-  const endpoint = `https://public-api.birdeye.so/v1/wallet/token_list?wallet=${walletAddress}`;
-  const options = {
-    method: "GET",
-    headers: {
-      accept: "application/json",
-      "X-API-KEY": apiKey,
-      "x-chain": "solana",
-    },
+function loadConfig(runtime: IAgentRuntime): IConfig {
+  const live = (runtime.getSetting("TRADING_MODE") || "").toLowerCase() === "live";
+  const mode = live ? "live" : "paper";
+  return {
+    live,
+    rpcUrl:
+      runtime.getSetting("SOLANA_RPC_URL") ||
+      runtime.getSetting("RPC_URL") ||
+      "https://api.mainnet-beta.solana.com",
+    jupiterUrl: (runtime.getSetting("JUPITER_API_URL") || "https://lite-api.jup.ag/swap/v1").replace(/\/$/, ""),
+    openAiApiKey: runtime.getSetting("OPENAI_API_KEY") || "",
+    openAiModel: runtime.getSetting("TRADING_OPENAI_MODEL") || "gpt-4o",
+    birdeyeApiKey: runtime.getSetting("BIRDEYE_API_KEY") || "",
+    tokenSource:
+      (runtime.getSetting("TRADING_TOKEN_SOURCE") || "").toLowerCase() === "birdeye" ? "birdeye" : "dexscreener",
+    minPairAgeHours: numSetting(runtime, "TRADING_MIN_PAIR_AGE_HOURS", 24),
+    maxPositionFraction: Math.min(Math.max(numSetting(runtime, "TRADING_MAX_POSITION_FRACTION", 0.2), 0), 1),
+    maxBuysPerCycle: Math.max(0, Math.floor(numSetting(runtime, "TRADING_MAX_BUYS_PER_CYCLE", 2))),
+    minLiquidityUsd: numSetting(runtime, "TRADING_MIN_LIQUIDITY_USD", 50_000),
+    minVolumeUsd: numSetting(runtime, "TRADING_MIN_VOLUME_USD", 100_000),
+    slippageBps: Math.max(1, Math.floor(numSetting(runtime, "TRADING_SLIPPAGE_BPS", 100))),
+    solReserve: numSetting(runtime, "TRADING_SOL_RESERVE", 0.02),
+    cooldownMs: numSetting(runtime, "TRADING_COOLDOWN_MINUTES", 60) * 60_000,
+    paperSol: numSetting(runtime, "TRADING_PAPER_SOL", 1),
+    stateFile: runtime.getSetting("TRADING_STATE_FILE") || path.join("data", `stoic-trading-${mode}.json`),
+    tweetsEnabled: live && (runtime.getSetting("TRADING_TWEETS_ENABLED") || "").toLowerCase() === "true",
   };
-  await sleep(5000);
-
-  const response = await fetch(endpoint, options);
-  if (!response.ok) {
-    throw new Error(`Wallet portfolio API call failed with status: ${response.status}`);
-  }
-  const portfolioData = await response.json();
-  const totalUsd = portfolioData?.data?.totalUsd || 0;
-  console.log(`Wallet Total USD: $${totalUsd}`);
-
-  if (solBalance >= 0.1 || totalUsd >= 20) {
-    return true;
-  }
-  console.log("Insufficient balance: need at least 0.1 SOL or $20 to proceed.");
-  return false;
 }
 
-function pickBirdEyeEndpoint(): string {
-  const endpoints = [
-    "https://public-api.birdeye.so/defi/token_trending?sort_by=rank&sort_type=asc&offset=0&limit=20",
-    "https://public-api.birdeye.so/defi/token_trending?sort_by=volume24hUSD&sort_type=asc&offset=0&limit=20",
-    "https://public-api.birdeye.so/defi/token_trending?sort_by=liquidity&sort_type=asc&offset=0&limit=20",
-    "https://public-api.birdeye.so/defi/v2/tokens/new_listing?limit=20&meme_platform_enabled=true"
-  ];
-  const idx = Math.floor(Math.random() * endpoints.length);
-  return endpoints[idx];
-}
+// ---------------------------------------------------------------------------
+// Persistent state (positions survive restarts)
+// ---------------------------------------------------------------------------
 
-async function getTradeRecommendation(
-  openAiApiKey: string,
-  cryptoTokensJson: object,
-  solBalance: number
-) {
-  if (!openAiApiKey || typeof openAiApiKey !== "string") {
-    throw new Error("Invalid OpenAI API key.");
-  }
-  if (typeof cryptoTokensJson !== "object" || cryptoTokensJson === null) {
-    throw new Error("Invalid cryptoTokensJson provided.");
-  }
-
-  const maxSolToUseFraction = 0.20;
-  const maxSolPerPosition = solBalance * maxSolToUseFraction;
-
-  const prompt = `
-You are a seasoned crypto trading expert. Focus only on providing token trading recommendations in valid JSON format.
-
-Key Constraints:
-1. ALWAYS use the SOL contract address ("So11111111111111111111111111111111111111112") as the input token.
-2. The output token's contract address must NOT be the same as the input token's address.
-3. If you would recommend SOL as an output token, skip it.
-4. My wallet SOL balance is ${solBalance.toFixed(4)}. Use at most ${(
-    maxSolToUseFraction * 100
-  ).toFixed(0)}% of this for any single trade (i.e. up to ${maxSolPerPosition.toFixed(4)} SOL max).
-5. Provide how much of each token to purchase (amountToBuy) and the approximate amount in SOL (amountToBuyInSol).
-
-Trending Tokens: ${JSON.stringify(cryptoTokensJson, null, 2)}
-
-Output ONLY valid JSON in the format:
-{
-  "recommendations": [
-    {
-      "ticker": "SYMBOL_HERE",
-      "inputTokenCA": "So11111111111111111111111111111111111111112",
-      "outputTokenCA": "OUTPUT_TOKEN_CONTRACT_ADDRESS",
-      "amountToBuy": "AMOUNT",
-      "amountToBuyInSol": "AMOUNT_IN_SOL"
-    }
-  ]
-}
-
-If no tokens are worth trading, return:
-{
-  "recommendations": []
-}
-`;
-
-  await sleep(15000);
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${openAiApiKey}`,
-    },
-    body: JSON.stringify({
-      model: "gpt-4",
-      messages: [
-        { role: "system", content: "You are ChatGPT, a crypto trading expert." },
-        { role: "user", content: prompt },
-      ],
-      temperature: 0,
-      max_tokens: 800,
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`OpenAI API Error: ${response.status} ${response.statusText}`);
-  }
-
-  const data = await response.json();
-  console.log("Raw OpenAI Response:", data);
-
-  const llmResponse = data.choices[0]?.message?.content?.trim();
-  if (!llmResponse) {
-    throw new Error("Invalid or empty response from OpenAI API.");
-  }
-  console.log("LLM Response:", llmResponse);
-
+function loadState(cfg: IConfig): ITradingState {
+  const fresh: ITradingState = {
+    mode: cfg.live ? "live" : "paper",
+    paperSol: cfg.paperSol,
+    positions: {},
+    realizedPnlSol: 0,
+    lastCycleAt: 0,
+    lastTweetContent: null,
+  };
   try {
-    const recommendations = JSON.parse(llmResponse);
-    if (!recommendations.recommendations) {
-      throw new Error("Recommendations key missing in LLM response.");
+    if (fs.existsSync(cfg.stateFile)) {
+      const parsed = JSON.parse(fs.readFileSync(cfg.stateFile, "utf8"));
+      if (parsed.mode !== fresh.mode) {
+        throw new Error(`State file ${cfg.stateFile} belongs to ${parsed.mode} mode, not ${fresh.mode}`);
+      }
+      return { ...fresh, ...parsed };
     }
-    return recommendations;
   } catch (err) {
-    console.error("OpenAI response parsing failed:", llmResponse);
-    throw new Error(`Error parsing recommendations JSON: ${err.message}`);
+    if (String(err).includes("belongs to")) throw err;
+    console.error(`Could not read trading state from ${cfg.stateFile}, starting fresh:`, err);
   }
+  return fresh;
 }
 
-async function fetchTokenMetadata(apiKey: string, addresses: string[]): Promise<Record<string, any>> {
-  if (addresses.length === 0) {
-    return {};
-  }
-  const encodedList = encodeURIComponent(addresses.join(","));
-  const endpoint = `https://public-api.birdeye.so/defi/v3/token/meta-data/multiple?list_address=${encodedList}`;
-  const options = {
+function saveState(cfg: IConfig, state: ITradingState) {
+  fs.mkdirSync(path.dirname(path.resolve(cfg.stateFile)), { recursive: true });
+  const tmp = `${cfg.stateFile}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+  fs.renameSync(tmp, cfg.stateFile);
+}
+
+// ---------------------------------------------------------------------------
+// External APIs
+// ---------------------------------------------------------------------------
+
+async function birdeyeGet(cfg: IConfig, url: string): Promise<any> {
+  const response = await fetch(url, {
     method: "GET",
-    headers: {
-      accept: "application/json",
-      "X-API-KEY": apiKey,
-      "x-chain": "solana",
-    },
-  };
-  await sleep(5000);
-
-  const response = await fetch(endpoint, options);
+    headers: { accept: "application/json", "X-API-KEY": cfg.birdeyeApiKey, "x-chain": "solana" },
+  });
   if (!response.ok) {
-    console.error(`Failed to fetch token metadata: ${response.status}`);
-    return {};
+    throw new Error(`Birdeye ${url} failed with status ${response.status}`);
   }
-  const result = await response.json();
-  const metaMap: Record<string, any> = {};
-
-  if (result && result.data && Array.isArray(result.data)) {
-    for (const item of result.data) {
-      if (!item?.address) continue;
-      metaMap[item.address] = item;
-    }
-  }
-  return metaMap;
+  return response.json();
 }
 
-async function generateTradeTweet(
-  openAiApiKey: string,
-  ticker: string,
-  outputTokenCA: string,
-  amountToBuyInSol: string,
-  tokenMetadata: any,
-  txExplorerUrl: string
-): Promise<string> {
-  const name = tokenMetadata?.name || ticker;
-  const symbol = tokenMetadata?.symbol || ticker;
-  const shortDesc = tokenMetadata?.description
-    ? tokenMetadata.description.slice(0, 100)
-    : "";
-
-  const prompt = `
-Generate a concise, professional tweet announcing the purchase of ${amountToBuyInSol} SOL worth of ${name} (${symbol}, CA: ${outputTokenCA}) Tx: ${txExplorerUrl}.
-You have these real facts from BirdEye:
-Name: ${name}
-Symbol: ${symbol}
-Short Description: ${shortDesc}
-
-Do not invent facts beyond this data.
-Use a stoic rationale maybe a quote from Marcus Aurelius or Seneca or any other stoic philosopher. No hashtags. Under 280 chars.
-`;
-
-  await sleep(15000);
+async function openAiChat(cfg: IConfig, prompt: string, temperature: number, maxTokens: number, json: boolean): Promise<string> {
   const response = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${openAiApiKey}`,
-    },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.openAiApiKey}` },
     body: JSON.stringify({
-      model: "gpt-4",
+      model: cfg.openAiModel,
       messages: [
-        { role: "system", content: "You are ChatGPT, a crypto trading expert." },
+        { role: "system", content: "You are a disciplined, risk-averse crypto trading assistant." },
         { role: "user", content: prompt },
       ],
-      temperature: 0.6,
-      max_tokens: 280,
+      temperature,
+      max_tokens: maxTokens,
+      ...(json ? { response_format: { type: "json_object" } } : {}),
     }),
   });
-
   if (!response.ok) {
-    throw new Error(`OpenAI API Error: ${response.status} ${response.statusText}`);
+    throw new Error(`OpenAI API Error: ${response.status} ${await response.text()}`);
   }
-
   const data = await response.json();
-  const tweetContent = data.choices[0]?.message?.content?.trim();
-  if (!tweetContent) {
-    throw new Error("Invalid response from OpenAI API (empty tweet).");
-  }
-
-  return tweetContent;
+  const content = data.choices?.[0]?.message?.content?.trim();
+  if (!content) throw new Error("Empty response from OpenAI API.");
+  return content;
 }
 
-async function generateSellTweet(
-  openAiApiKey: string,
-  ticker: string,
-  tokensSold: number,
-  solReceived: number,
-  approxProfitSol: number
-): Promise<string> {
-  const prompt = `
-Write a concise tweet announcing we sold ${tokensSold.toFixed(2)} tokens of ${ticker}, receiving approx ${solReceived.toFixed(
-    3
-  )} SOL.
-Profit (or loss) ~ ${approxProfitSol.toFixed(3)} SOL.
-A stoic perspective, no hashtags, under 280 characters.
-`;
-  await sleep(15000);
-
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${openAiApiKey}`,
-    },
-    body: JSON.stringify({
-      model: "gpt-4",
-      messages: [
-        { role: "system", content: "You are ChatGPT, a crypto trading expert." },
-        { role: "user", content: prompt },
-      ],
-      temperature: 0.6,
-      max_tokens: 280,
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`OpenAI API Error: ${response.status} ${response.statusText}`);
-  }
-
-  const data = await response.json();
-  const tweetContent = data.choices[0]?.message?.content?.trim();
-  if (!tweetContent) {
-    throw new Error("Invalid response from OpenAI API (empty tweet).");
-  }
-
-  return tweetContent;
+interface IQuote {
+  raw: any;
+  inAmount: BigNumber;
+  outAmount: BigNumber;
+  priceImpactPct: number;
 }
 
-export async function getTokenDecimals(
-  connection: Connection,
-  tokenMintAddress: string
-): Promise<number> {
-  try {
-    const tokenMintPublicKey = new PublicKey(tokenMintAddress);
-    const tokenAccountInfo = await connection.getParsedAccountInfo(tokenMintPublicKey);
-    if (!tokenAccountInfo || !tokenAccountInfo.value) {
-      throw new Error("Token account not found on the blockchain.");
-    }
-    const tokenData = tokenAccountInfo.value.data as any;
-    if (!tokenData || !tokenData.parsed) {
-      throw new Error("Invalid token account data.");
-    }
-    const decimals = tokenData.parsed.info.decimals;
-    return decimals;
-  } catch (error) {
-    console.error(`Error fetching token decimals for mint ${tokenMintAddress}:`, error);
-    throw error;
+async function getQuote(cfg: IConfig, inputMint: string, outputMint: string, amountBaseUnits: BigNumber): Promise<IQuote | null> {
+  const url =
+    `${cfg.jupiterUrl}/quote?inputMint=${inputMint}&outputMint=${outputMint}` +
+    `&amount=${amountBaseUnits.toFixed(0)}&slippageBps=${cfg.slippageBps}`;
+  const response = await fetch(url);
+  const data = await response.json().catch(() => null);
+  // Jupiter's quote response carries inAmount/outAmount at the top level.
+  if (!response.ok || !data || data.error || !data.outAmount) {
+    console.error("Jupiter quote failed:", response.status, data);
+    return null;
   }
-}
-
-async function buyRecommendedTokens(recommendations: any[], runtime: IAgentRuntime) {
-  const openAiApiKey = runtime.getSetting("OPENAI_API_KEY") || "";
-  const apiKey = runtime.getSetting("BIRDEYE_API_KEY") || "";
-  const connection = new Connection("https://api.mainnet-beta.solana.com");
-  const { publicKey: walletPublicKey } = await getWalletKey(runtime, false);
-  const lamportsBalance = await connection.getBalance(walletPublicKey);
-  const solBalance = lamportsBalance / 1e9;
-
-  const finalRecs = recommendations.filter(
-    (r) => !recentlyPurchasedTokens.has(r.outputTokenCA)
-  );
-  const addressesToFetch = finalRecs.map((r) => r.outputTokenCA);
-  const metadataMap = await fetchTokenMetadata(apiKey, addressesToFetch);
-
-  for (const recommendation of finalRecs) {
-    const {
-      ticker,
-      inputTokenCA,
-      outputTokenCA,
-      amountToBuy,
-      amountToBuyInSol
-    } = recommendation;
-
-    if (!ticker || !inputTokenCA || !outputTokenCA || !amountToBuy || !amountToBuyInSol) {
-      console.error("Invalid recommendation data:", recommendation);
-      continue;
-    }
-    if (inputTokenCA === outputTokenCA) {
-      console.error("Error: LLM recommended same input & output. Skipping trade.");
-      continue;
-    }
-
-    const desiredSol = new BigNumber(amountToBuyInSol);
-    if (desiredSol.isNaN() || desiredSol.lte(0)) {
-      console.error(`LLM recommended invalid SOL: ${desiredSol.toString()}. Skipping...`);
-      continue;
-    }
-
-    const safeSolForTrade = solBalance - 0.01;
-    if (desiredSol.gt(safeSolForTrade)) {
-      console.error(`LLM suggests ${desiredSol.toString()} SOL but we only have ${safeSolForTrade} SOL. Skipping...`);
-      continue;
-    }
-
-    console.log(`Preparing to swap ${desiredSol.toString()} of ${inputTokenCA} for ${outputTokenCA}`);
-    const inputTokenDecimals =
-      inputTokenCA === "So11111111111111111111111111111111111111112"
-        ? new BigNumber(9)
-        : new BigNumber(await getTokenDecimals(connection, inputTokenCA));
-
-    let adjustedAmount = new BigNumber(amountToBuyInSol)
-      .multipliedBy(new BigNumber(10).pow(inputTokenDecimals))
-      .integerValue(BigNumber.ROUND_DOWN);
-
-    if (adjustedAmount.lte(0)) {
-      console.error(`Invalid adjusted amount: ${adjustedAmount.toString()}. Skipping...`);
-      continue;
-    }
-    console.log("Adjusted Amount (base units):", adjustedAmount.toString());
-
-    await sleep(5000);
-
-    const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputTokenCA}&outputMint=${outputTokenCA}&amount=${adjustedAmount}&slippageBps=50`;
-    const quoteResponse = await fetch(quoteUrl);
-    const quoteData = await quoteResponse.json();
-
-    if (!quoteData || quoteData.error) {
-      console.error("Error fetching quote for swap:", quoteData);
-      continue;
-    }
-    console.log("Quote data received:", quoteData);
-
-    const swapRequestBody = {
-      quoteResponse: quoteData,
-      userPublicKey: walletPublicKey.toString(),
-      wrapAndUnwrapSol: true,
-      computeUnitPriceMicroLamports: 2000000,
-      dynamicComputeUnitLimit: true,
-    };
-    await sleep(5000);
-
-    const swapResponse = await fetch("https://quote-api.jup.ag/v6/swap", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(swapRequestBody),
-    });
-    const swapData = await swapResponse.json();
-
-    if (!swapData || !swapData.swapTransaction) {
-      console.error("Error executing swap transaction:", swapData);
-      continue;
-    }
-    console.log("Swap transaction received:", swapData);
-
-    const transactionBuf = Buffer.from(swapData.swapTransaction, "base64");
-    const transaction = VersionedTransaction.deserialize(transactionBuf);
-
-    console.log("Signing transaction...");
-    const { keypair } = await getWalletKey(runtime, true);
-    if (keypair.publicKey.toBase58() !== walletPublicKey.toBase58()) {
-      throw new Error("Generated public key doesn't match expected public key");
-    }
-    transaction.sign([keypair]);
-
-    console.log("Sending transaction...");
-    const latestBlockhash = await connection.getLatestBlockhash();
-    let txid: string;
-    try {
-      txid = await connection.sendTransaction(transaction, {
-        skipPreflight: false,
-        maxRetries: 3,
-        preflightCommitment: "confirmed",
-      });
-    } catch (err) {
-      console.error("Send transaction error:", err);
-      continue;
-    }
-    console.log(`Transaction sent successfully! Transaction ID: ${txid}`);
-    const txExplorerUrl = `https://solscan.io/tx/${txid}?cluster=mainnet`;
-
-    const outAmountLamports = quoteData?.data?.[0]?.outAmount || 0;
-    const outputTokenDecimals =
-      outputTokenCA === "So11111111111111111111111111111111111111112"
-        ? 9
-        : await getTokenDecimals(connection, outputTokenCA);
-
-    const acquiredQuantityBN = new BigNumber(outAmountLamports).div(
-      new BigNumber(10).pow(outputTokenDecimals)
-    );
-    if (acquiredQuantityBN.isFinite() && acquiredQuantityBN.gt(1e-12)) {
-      const acquiredQuantity = acquiredQuantityBN.toNumber();
-      const spentSol = parseFloat(amountToBuyInSol);
-
-      const costBasisSOL = new BigNumber(spentSol).div(acquiredQuantityBN).toNumber();
-      purchasedPositions[outputTokenCA] = {
-        ticker,
-        tokenCA: outputTokenCA,
-        costBasisSOL,
-        quantity: (purchasedPositions[outputTokenCA]?.quantity || 0) + acquiredQuantity,
-        partialSales: purchasedPositions[outputTokenCA]?.partialSales || 0,
-      };
-    } else {
-      console.warn("Acquired quantity too small or invalid; skipping cost basis update");
-    }
-
-    recentlyPurchasedTokens.add(outputTokenCA);
-    await sleep(500000); // 5 minutes between trades/tweets
-
-    const postTweet = async (tweetContent: string): Promise<void> => {
-      try {
-        if (lastTweetContent === tweetContent) {
-          console.log("Tweet content is the same as last tweet. Skipping...");
-          return;
-        }
-        const scraper = await initializeScraper();
-        await sleep(15000);
-        await scraper.sendTweet(tweetContent);
-        console.log("Tweet posted successfully:", tweetContent);
-        lastTweetContent = tweetContent;
-      } catch (error) {
-        console.error("Failed to post trade tweet:", error);
-      }
-    };
-
-    try {
-      const meta = metadataMap[outputTokenCA] || {};
-      const tweetContent = await generateTradeTweet(
-        openAiApiKey,
-        ticker,
-        outputTokenCA,
-        amountToBuyInSol,
-        meta,
-        txExplorerUrl
-      );
-      console.log("Generated Tweet:", tweetContent);
-      await postTweet(tweetContent);
-    } catch (error) {
-      console.error("Error generating tweet:", error);
-    }
-  }
-
-  console.log("All buy recommendations processed.");
-}
-
-async function fetchCurrentPriceInSOL(tokenMint: string, connection: Connection): Promise<number> {
-  try {
-    const decimals = await getTokenDecimals(connection, tokenMint);
-    const oneTokenInBaseUnits = new BigNumber(10).pow(decimals).toString();
-    const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${tokenMint}&outputMint=So11111111111111111111111111111111111111112&amount=${oneTokenInBaseUnits}&slippageBps=50`;
-    const quoteResponse = await fetch(quoteUrl);
-    const quoteData = await quoteResponse.json();
-    const outAmountLamports = quoteData?.data?.[0]?.outAmount || 0;
-    const outSOL = new BigNumber(outAmountLamports).div(1e9).toNumber();
-    return outSOL;
-  } catch (error) {
-    console.error("Error fetching current price in SOL:", error);
-    return 0;
-  }
-}
-
-async function sellExactPercentageOfPosition(
-  runtime: IAgentRuntime,
-  pos: IPosition,
-  fraction: number
-) {
-  const openAiApiKey = runtime.getSetting("OPENAI_API_KEY") || "";
-  const connection = new Connection("https://api.mainnet-beta.solana.com");
-  const { publicKey: walletPublicKey } = await getWalletKey(runtime, false);
-
-  const tokensToSell = pos.quantity * fraction;
-  if (tokensToSell <= 0) return;
-
-  const decimals = await getTokenDecimals(connection, pos.tokenCA);
-  let adjustedAmount = new BigNumber(tokensToSell)
-    .multipliedBy(new BigNumber(10).pow(decimals))
-    .integerValue(BigNumber.ROUND_DOWN);
-
-  const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${pos.tokenCA}&outputMint=So11111111111111111111111111111111111111112&amount=${adjustedAmount}&slippageBps=50`;
-  await sleep(3000);
-  const quoteResponse = await fetch(quoteUrl);
-  const quoteData = await quoteResponse.json();
-
-  if (!quoteData || quoteData.error) {
-    console.error("Error fetching quote for selling:", quoteData);
-    return;
-  }
-
-  const swapRequestBody = {
-    quoteResponse: quoteData,
-    userPublicKey: walletPublicKey.toString(),
-    wrapAndUnwrapSol: true,
-    computeUnitPriceMicroLamports: 2000000,
-    dynamicComputeUnitLimit: true,
+  return {
+    raw: data,
+    inAmount: new BigNumber(data.inAmount),
+    outAmount: new BigNumber(data.outAmount),
+    priceImpactPct: Number(data.priceImpactPct || 0) * 100,
   };
-  await sleep(3000);
+}
 
-  const swapResponse = await fetch("https://quote-api.jup.ag/v6/swap", {
+/** Builds, signs, sends and confirms a Jupiter swap. Returns the signature, or null on failure. */
+async function executeSwap(runtime: IAgentRuntime, cfg: IConfig, connection: Connection, quote: IQuote): Promise<string | null> {
+  const { keypair } = await getWalletKey(runtime, true);
+  const swapResponse = await fetch(`${cfg.jupiterUrl}/swap`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(swapRequestBody),
+    body: JSON.stringify({
+      quoteResponse: quote.raw,
+      userPublicKey: keypair.publicKey.toBase58(),
+      wrapAndUnwrapSol: true,
+      dynamicComputeUnitLimit: true,
+      prioritizationFeeLamports: "auto",
+    }),
   });
-  const swapData = await swapResponse.json();
-  if (!swapData || !swapData.swapTransaction) {
-    console.error("Error executing swap transaction for selling:", swapData);
-    return;
+  const swapData = await swapResponse.json().catch(() => null);
+  if (!swapResponse.ok || !swapData?.swapTransaction) {
+    console.error("Jupiter swap build failed:", swapData);
+    return null;
   }
 
-  const transactionBuf = Buffer.from(swapData.swapTransaction, "base64");
-  const transaction = VersionedTransaction.deserialize(transactionBuf);
-  console.log("Signing sell transaction...");
-
-  const { keypair } = await getWalletKey(runtime, true);
+  const transaction = VersionedTransaction.deserialize(Buffer.from(swapData.swapTransaction, "base64"));
   transaction.sign([keypair]);
 
-  let txid: string;
+  let signature: string;
   try {
-    txid = await connection.sendTransaction(transaction, {
+    signature = await connection.sendTransaction(transaction, {
       skipPreflight: false,
       maxRetries: 3,
       preflightCommitment: "confirmed",
     });
   } catch (err) {
-    console.error("Send transaction error (selling):", err);
-    return;
+    console.error("Send transaction error:", err);
+    return null;
   }
-  console.log(`Sell transaction sent successfully! Transaction ID: ${txid}`);
-
-  pos.quantity -= tokensToSell;
-  console.log(`Sold ${tokensToSell} tokens of ${pos.ticker}. Remaining quantity = ${pos.quantity}`);
-
-  const outAmountLamports = quoteData?.data?.[0]?.outAmount || 0;
-  const solReceived = new BigNumber(outAmountLamports).div(1e9).toNumber();
-
-  const currentPriceSOL = await fetchCurrentPriceInSOL(pos.tokenCA, connection);
-  const profitPerTokenInSOL = currentPriceSOL - pos.costBasisSOL;
-  const approximateProfitInSOL = profitPerTokenInSOL * tokensToSell;
-
-  const postTweet = async (tweetContent: string): Promise<void> => {
-    try {
-      if (lastTweetContent === tweetContent) {
-        console.log("Tweet content is the same as last tweet. Skipping...");
-        return;
-      }
-      const scraper = await initializeScraper();
-      await sleep(15000);
-      await scraper.sendTweet(tweetContent);
-      console.log("Sell Tweet posted successfully:", tweetContent);
-      lastTweetContent = tweetContent;
-    } catch (error) {
-      console.error("Failed to post sell tweet:", error);
-    }
-  };
 
   try {
-    const tweetContent = await generateSellTweet(
-      openAiApiKey,
-      pos.ticker,
-      tokensToSell,
-      solReceived,
-      approximateProfitInSOL
+    const lastValidBlockHeight =
+      swapData.lastValidBlockHeight ?? (await connection.getLatestBlockhash("confirmed")).lastValidBlockHeight;
+    const confirmation = await connection.confirmTransaction(
+      { signature, blockhash: transaction.message.recentBlockhash, lastValidBlockHeight },
+      "confirmed"
     );
-    console.log("Generated Sell Tweet:", tweetContent);
-    await postTweet(tweetContent);
-  } catch (error) {
-    console.error("Error generating tweet for sale:", error);
+    if (confirmation.value.err) {
+      console.error(`Transaction ${signature} failed on-chain:`, confirmation.value.err);
+      return null;
+    }
+  } catch (err) {
+    console.error(`Could not confirm transaction ${signature}; not recording it:`, err);
+    return null;
+  }
+  return signature;
+}
+
+export async function getTokenDecimals(connection: Connection, tokenMintAddress: string): Promise<number> {
+  if (tokenMintAddress === SOL_MINT) return 9;
+  const info = await connection.getParsedAccountInfo(new PublicKey(tokenMintAddress));
+  const decimals = (info?.value?.data as any)?.parsed?.info?.decimals;
+  if (typeof decimals !== "number") {
+    throw new Error(`Could not read decimals for mint ${tokenMintAddress}`);
+  }
+  return decimals;
+}
+
+async function postTweet(cfg: IConfig, state: ITradingState, content: string) {
+  if (!cfg.tweetsEnabled) {
+    console.log(`[tweet not sent] ${content}`);
+    return;
+  }
+  if (state.lastTweetContent === content) return;
+  try {
+    const scraper = new Scraper();
+    if (!(await scraper.isLoggedIn())) {
+      const username = process.env.TWITTER_USERNAME || "";
+      const password = process.env.TWITTER_PASSWORD || "";
+      if (!username || !password) throw new Error("Missing TWITTER_USERNAME or TWITTER_PASSWORD.");
+      await scraper.login(username, password, process.env.TWITTER_EMAIL || "");
+    }
+    await scraper.sendTweet(content);
+    state.lastTweetContent = content;
+    console.log("Tweet posted:", content);
+  } catch (err) {
+    console.error("Failed to post tweet:", err);
   }
 }
 
-async function sellTokensIfNeeded(runtime: IAgentRuntime) {
-  console.log("Checking if we should sell any positions based on PnL thresholds...");
-  const connection = new Connection("https://api.mainnet-beta.solana.com");
-  const positionsList = Object.values(purchasedPositions);
+// ---------------------------------------------------------------------------
+// Candidate selection
+// ---------------------------------------------------------------------------
 
-  for (const pos of positionsList) {
-    if (pos.quantity <= 0) {
-      continue;
-    }
-    const currentPriceSOL = await fetchCurrentPriceInSOL(pos.tokenCA, connection);
-    if (!currentPriceSOL) {
-      console.log(`Cannot fetch price for token: ${pos.tokenCA}, skipping...`);
-      continue;
-    }
-    const ratio = currentPriceSOL / pos.costBasisSOL;
-    console.log(
-      `Ticker ${pos.ticker}, ratio = ${ratio.toFixed(2)} (current / costBasis). partialSales: ${pos.partialSales}`
-    );
+function passesFilters(cfg: IConfig, c: ICandidate): boolean {
+  return c.liquidityUsd >= cfg.minLiquidityUsd && c.volume24hUsd >= cfg.minVolumeUsd;
+}
 
-    if (ratio <= 0.5) {
-      await sellExactPercentageOfPosition(runtime, pos, 1.0);
-      pos.quantity = 0;
-      console.log(`Sold 100% of ${pos.ticker} due to -50% drawdown.`);
-      continue;
-    }
-    if (ratio >= 2 && pos.partialSales < 1) {
-      await sellExactPercentageOfPosition(runtime, pos, 0.5);
-      pos.partialSales = 1;
-    }
-    if (ratio >= 4 && pos.partialSales < 2) {
-      await sellExactPercentageOfPosition(runtime, pos, 0.25);
-      pos.partialSales = 2;
-    }
-    if (ratio >= 8 && pos.partialSales < 3) {
-      await sellExactPercentageOfPosition(runtime, pos, 0.15);
-      pos.partialSales = 3;
-    }
-    if (ratio >= 16 && pos.partialSales < 4) {
-      await sellExactPercentageOfPosition(runtime, pos, 0.1);
-      pos.partialSales = 4;
+async function fetchCandidates(cfg: IConfig): Promise<ICandidate[]> {
+  return cfg.tokenSource === "birdeye" ? fetchBirdeyeCandidates(cfg) : fetchDexScreenerCandidates(cfg);
+}
+
+/**
+ * Free, keyless source: Solana tokens from DexScreener's latest profiles and top
+ * boosts, enriched with pair data. Liquidity and volume are summed over each
+ * token's pairs; pairs younger than TRADING_MIN_PAIR_AGE_HOURS are ignored.
+ */
+async function fetchDexScreenerCandidates(cfg: IConfig): Promise<ICandidate[]> {
+  const base = "https://api.dexscreener.com";
+  const getJson = async (url: string) => {
+    const r = await fetch(url, { headers: { accept: "application/json" } });
+    if (!r.ok) throw new Error(`DexScreener ${url} failed with status ${r.status}`);
+    return r.json();
+  };
+
+  const lists = await Promise.all([
+    getJson(`${base}/token-profiles/latest/v1`),
+    getJson(`${base}/token-boosts/top/v1`),
+  ]);
+  const addresses = [
+    ...new Set(
+      lists
+        .flat()
+        .filter((t: any) => t?.chainId === "solana" && t?.tokenAddress && t.tokenAddress !== SOL_MINT)
+        .map((t: any) => String(t.tokenAddress))
+    ),
+  ];
+
+  const minCreatedAt = Date.now() - cfg.minPairAgeHours * 3_600_000;
+  const byToken = new Map<string, ICandidate & { bestLiquidity: number }>();
+  for (let i = 0; i < addresses.length; i += 30) {
+    const pairs: any[] = await getJson(`${base}/tokens/v1/solana/${addresses.slice(i, i + 30).join(",")}`);
+    for (const p of pairs || []) {
+      const addr = p?.baseToken?.address;
+      if (!addr || !addresses.includes(addr)) continue;
+      if (!p.pairCreatedAt || p.pairCreatedAt > minCreatedAt) continue;
+      const liq = Number(p.liquidity?.usd || 0);
+      const vol = Number(p.volume?.h24 || 0);
+      const prev = byToken.get(addr);
+      if (!prev) {
+        byToken.set(addr, {
+          symbol: String(p.baseToken.symbol || "?"),
+          address: addr,
+          liquidityUsd: liq,
+          volume24hUsd: vol,
+          priceUsd: Number(p.priceUsd || 0),
+          rank: null,
+          bestLiquidity: liq,
+        });
+      } else {
+        prev.liquidityUsd += liq;
+        prev.volume24hUsd += vol;
+        if (liq > prev.bestLiquidity) {
+          prev.bestLiquidity = liq;
+          prev.priceUsd = Number(p.priceUsd || 0);
+        }
+      }
     }
   }
-  console.log("Finished checking all positions for partial sells / stop-losses.");
+
+  const candidates = [...byToken.values()]
+    .map(({ bestLiquidity: _b, ...c }) => c)
+    .filter((c) => passesFilters(cfg, c))
+    .sort((a, b) => b.liquidityUsd - a.liquidityUsd)
+    .slice(0, 20);
+  console.log(
+    `DexScreener: ${addresses.length} Solana tokens, ${byToken.size} with pairs older than ${cfg.minPairAgeHours}h, ` +
+      `${candidates.length} passed liquidity/volume filters.`
+  );
+  return candidates;
+}
+
+async function fetchBirdeyeCandidates(cfg: IConfig): Promise<ICandidate[]> {
+  // Sorted descending so the most liquid / most traded trending tokens come first.
+  const endpoints = [
+    "https://public-api.birdeye.so/defi/token_trending?sort_by=rank&sort_type=asc&offset=0&limit=20",
+    "https://public-api.birdeye.so/defi/token_trending?sort_by=volume24hUSD&sort_type=desc&offset=0&limit=20",
+    "https://public-api.birdeye.so/defi/token_trending?sort_by=liquidity&sort_type=desc&offset=0&limit=20",
+  ];
+  const endpoint = endpoints[Math.floor(Math.random() * endpoints.length)];
+  console.log(`Birdeye endpoint: ${endpoint}`);
+  const data = await birdeyeGet(cfg, endpoint);
+
+  const tokens: any[] = data?.data?.tokens || [];
+  const candidates = tokens
+    .filter((t) => t?.address && t?.symbol && t.address !== SOL_MINT)
+    .map((t) => ({
+      symbol: String(t.symbol),
+      address: String(t.address),
+      liquidityUsd: Number(t.liquidity || 0),
+      volume24hUsd: Number(t.volume24hUSD || 0),
+      priceUsd: Number(t.price || 0),
+      rank: t.rank ?? null,
+    }))
+    .filter((c) => passesFilters(cfg, c));
+
+  console.log(`Birdeye: ${candidates.length}/${tokens.length} tokens passed liquidity/volume filters.`);
+  return candidates;
+}
+
+async function getTradeRecommendations(cfg: IConfig, candidates: ICandidate[], solBalance: number, maxSolPerPosition: number) {
+  const prompt = `
+You pick at most ${cfg.maxBuysPerCycle} Solana tokens to buy with SOL from the candidate list below, or none.
+Prefer deep liquidity, healthy volume relative to liquidity, and avoid anything that looks like a pump.
+Wallet balance: ${solBalance.toFixed(4)} SOL. Never allocate more than ${maxSolPerPosition.toFixed(4)} SOL to one token.
+
+Candidates (only these addresses are allowed):
+${JSON.stringify(candidates, null, 2)}
+
+Reply with JSON only:
+{"recommendations":[{"ticker":"SYMBOL","outputTokenCA":"ADDRESS_FROM_LIST","amountToBuyInSol":0.05,"reason":"one sentence"}]}
+Return {"recommendations":[]} if nothing is worth buying.
+`;
+  const raw = await openAiChat(cfg, prompt, 0, 800, true);
+  const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
+  const parsed = JSON.parse(cleaned);
+  if (!Array.isArray(parsed?.recommendations)) {
+    throw new Error(`LLM response missing recommendations array: ${raw}`);
+  }
+  return parsed.recommendations as Array<{ ticker: string; outputTokenCA: string; amountToBuyInSol: number | string; reason?: string }>;
+}
+
+// ---------------------------------------------------------------------------
+// Buying and selling
+// ---------------------------------------------------------------------------
+
+async function getSpendableSol(runtime: IAgentRuntime, cfg: IConfig, connection: Connection, state: ITradingState): Promise<number> {
+  if (!cfg.live) return state.paperSol;
+  const { publicKey } = await getWalletKey(runtime, false);
+  return (await connection.getBalance(publicKey)) / 1e9;
+}
+
+async function buyRecommendedTokens(
+  runtime: IAgentRuntime,
+  cfg: IConfig,
+  connection: Connection,
+  state: ITradingState,
+  candidates: ICandidate[],
+  recommendations: Awaited<ReturnType<typeof getTradeRecommendations>>
+) {
+  const allowed = new Map(candidates.map((c) => [c.address, c]));
+  let buys = 0;
+
+  for (const rec of recommendations) {
+    if (buys >= cfg.maxBuysPerCycle) break;
+
+    const candidate = allowed.get(rec?.outputTokenCA);
+    if (!candidate) {
+      console.error(`LLM recommended an address that is not in the candidate list, skipping: ${rec?.outputTokenCA}`);
+      continue;
+    }
+    if (state.positions[candidate.address]?.quantity > 0) {
+      console.log(`Already holding ${candidate.symbol}, skipping.`);
+      continue;
+    }
+
+    const balance = await getSpendableSol(runtime, cfg, connection, state);
+    const cap = Math.min(balance * cfg.maxPositionFraction, balance - cfg.solReserve);
+    const requested = Number(rec.amountToBuyInSol);
+    if (!Number.isFinite(requested) || requested <= 0) {
+      console.error(`Invalid SOL amount from LLM: ${rec.amountToBuyInSol}, skipping.`);
+      continue;
+    }
+    const spendSol = Math.min(requested, cap);
+    if (spendSol <= 0.001) {
+      console.log(`Not enough spendable SOL for ${candidate.symbol} (cap ${cap.toFixed(4)}), stopping buys.`);
+      break;
+    }
+    if (spendSol < requested) {
+      console.log(`Capping ${candidate.symbol} buy from ${requested} to ${spendSol.toFixed(4)} SOL.`);
+    }
+
+    const lamports = new BigNumber(spendSol).multipliedBy(1e9).integerValue(BigNumber.ROUND_DOWN);
+    const quote = await getQuote(cfg, SOL_MINT, candidate.address, lamports);
+    if (!quote) continue;
+    if (quote.priceImpactPct > 2) {
+      console.log(`Price impact ${quote.priceImpactPct.toFixed(2)}% too high for ${candidate.symbol}, skipping.`);
+      continue;
+    }
+
+    const decimals = await getTokenDecimals(connection, candidate.address);
+    const quantity = quote.outAmount.div(new BigNumber(10).pow(decimals)).toNumber();
+    const spentSol = quote.inAmount.div(1e9).toNumber();
+    if (!(quantity > 0)) {
+      console.error(`Quote for ${candidate.symbol} returned zero output, skipping.`);
+      continue;
+    }
+
+    let txUrl = "(paper trade)";
+    if (cfg.live) {
+      const signature = await executeSwap(runtime, cfg, connection, quote);
+      if (!signature) continue;
+      txUrl = `https://solscan.io/tx/${signature}`;
+    } else {
+      state.paperSol -= spentSol;
+    }
+
+    state.positions[candidate.address] = {
+      ticker: candidate.symbol,
+      tokenCA: candidate.address,
+      costBasisSOL: spentSol / quantity,
+      quantity,
+      decimals,
+      partialSales: 0,
+      openedAt: new Date().toISOString(),
+    };
+    saveState(cfg, state);
+    buys++;
+    console.log(
+      `${cfg.live ? "BOUGHT" : "PAPER BUY"} ${quantity} ${candidate.symbol} for ${spentSol.toFixed(4)} SOL. ${rec.reason || ""} ${txUrl}`
+    );
+
+    try {
+      const tweet = await openAiChat(
+        cfg,
+        `Write a concise, professional tweet announcing the purchase of ${spentSol.toFixed(3)} SOL of ${candidate.symbol} ` +
+          `(CA: ${candidate.address}). Tx: ${txUrl}. Do not invent facts. Add a short stoic rationale, ` +
+          `perhaps a quote from Marcus Aurelius or Seneca. No hashtags. Under 280 characters.`,
+        0.6,
+        200,
+        false
+      );
+      await postTweet(cfg, state, tweet);
+    } catch (err) {
+      console.error("Error generating buy tweet:", err);
+    }
+  }
+}
+
+async function fetchCurrentPriceInSOL(cfg: IConfig, pos: IPosition): Promise<number> {
+  const oneToken = new BigNumber(10).pow(pos.decimals);
+  const quote = await getQuote(cfg, pos.tokenCA, SOL_MINT, oneToken);
+  return quote ? quote.outAmount.div(1e9).toNumber() : 0;
+}
+
+/** Sells `fraction` of the position. Returns true only if the sale happened. */
+async function sellFractionOfPosition(
+  runtime: IAgentRuntime,
+  cfg: IConfig,
+  connection: Connection,
+  state: ITradingState,
+  pos: IPosition,
+  fraction: number,
+  reason: string
+): Promise<boolean> {
+  const tokensToSell = fraction >= 1 ? pos.quantity : pos.quantity * fraction;
+  if (tokensToSell <= 0) return false;
+
+  const baseUnits = new BigNumber(tokensToSell).multipliedBy(new BigNumber(10).pow(pos.decimals)).integerValue(BigNumber.ROUND_DOWN);
+  const quote = await getQuote(cfg, pos.tokenCA, SOL_MINT, baseUnits);
+  if (!quote) return false;
+
+  const solReceived = quote.outAmount.div(1e9).toNumber();
+  if (cfg.live) {
+    const signature = await executeSwap(runtime, cfg, connection, quote);
+    if (!signature) return false;
+    console.log(`Sell tx: https://solscan.io/tx/${signature}`);
+  } else {
+    state.paperSol += solReceived;
+  }
+
+  const pnl = solReceived - pos.costBasisSOL * tokensToSell;
+  pos.quantity = fraction >= 1 ? 0 : pos.quantity - tokensToSell;
+  state.realizedPnlSol += pnl;
+  if (pos.quantity <= 0) delete state.positions[pos.tokenCA];
+  saveState(cfg, state);
+  console.log(
+    `${cfg.live ? "SOLD" : "PAPER SELL"} ${tokensToSell} ${pos.ticker} for ${solReceived.toFixed(4)} SOL ` +
+      `(${reason}, PnL ${pnl >= 0 ? "+" : ""}${pnl.toFixed(4)} SOL)`
+  );
+
+  try {
+    const tweet = await openAiChat(
+      cfg,
+      `Write a concise tweet announcing we sold ${tokensToSell.toFixed(2)} ${pos.ticker} for about ${solReceived.toFixed(3)} SOL, ` +
+        `a ${pnl >= 0 ? "profit" : "loss"} of about ${Math.abs(pnl).toFixed(3)} SOL. A stoic perspective, no hashtags, under 280 characters.`,
+      0.6,
+      200,
+      false
+    );
+    await postTweet(cfg, state, tweet);
+  } catch (err) {
+    console.error("Error generating sell tweet:", err);
+  }
+  return true;
+}
+
+// Take-profit ladder: [price multiple, fraction of remaining position to sell]
+const TAKE_PROFIT_LADDER: Array<[number, number]> = [
+  [2, 0.5],
+  [4, 0.25],
+  [8, 0.15],
+  [16, 0.1],
+];
+const STOP_LOSS_RATIO = 0.5;
+
+async function sellTokensIfNeeded(runtime: IAgentRuntime, cfg: IConfig, connection: Connection, state: ITradingState) {
+  for (const pos of Object.values(state.positions)) {
+    if (pos.quantity <= 0) continue;
+    const price = await fetchCurrentPriceInSOL(cfg, pos);
+    if (!price) {
+      console.log(`No price for ${pos.ticker}, skipping.`);
+      continue;
+    }
+    const ratio = price / pos.costBasisSOL;
+    console.log(`${pos.ticker}: ${ratio.toFixed(2)}x cost basis, partial sales ${pos.partialSales}`);
+
+    if (ratio <= STOP_LOSS_RATIO) {
+      await sellFractionOfPosition(runtime, cfg, connection, state, pos, 1, "stop-loss");
+      continue;
+    }
+    for (let i = pos.partialSales; i < TAKE_PROFIT_LADDER.length; i++) {
+      const [multiple, fraction] = TAKE_PROFIT_LADDER[i];
+      if (ratio < multiple) break;
+      const sold = await sellFractionOfPosition(runtime, cfg, connection, state, pos, fraction, `take-profit ${multiple}x`);
+      if (!sold) break;
+      pos.partialSales = i + 1;
+      saveState(cfg, state);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Cycle
+// ---------------------------------------------------------------------------
+
+export async function runTradingCycle(runtime: IAgentRuntime, opts: { ignoreCooldown?: boolean } = {}): Promise<boolean> {
+  if (cycleRunning) {
+    console.log("A trading cycle is already running, skipping.");
+    return false;
+  }
+  cycleRunning = true;
+  try {
+    const cfg = loadConfig(runtime);
+    if (!cfg.openAiApiKey) {
+      throw new Error("OPENAI_API_KEY is required.");
+    }
+    if (cfg.tokenSource === "birdeye" && !cfg.birdeyeApiKey) {
+      throw new Error("BIRDEYE_API_KEY is required when TRADING_TOKEN_SOURCE=birdeye.");
+    }
+    const state = loadState(cfg);
+    const sinceLast = Date.now() - state.lastCycleAt;
+    if (!opts.ignoreCooldown && sinceLast < cfg.cooldownMs) {
+      console.log(`Cooldown: next cycle in ${Math.ceil((cfg.cooldownMs - sinceLast) / 60_000)} min.`);
+      return false;
+    }
+    state.lastCycleAt = Date.now();
+    saveState(cfg, state);
+
+    console.log(`=== Trading cycle (${cfg.live ? "LIVE — real funds" : "PAPER — no transactions are sent"}) ===`);
+    const connection = new Connection(cfg.rpcUrl, "confirmed");
+
+    // Manage existing positions first so stops are not delayed by new buys.
+    await sellTokensIfNeeded(runtime, cfg, connection, state);
+
+    const balance = await getSpendableSol(runtime, cfg, connection, state);
+    const maxSolPerPosition = Math.min(balance * cfg.maxPositionFraction, balance - cfg.solReserve);
+    console.log(`Spendable balance ${balance.toFixed(4)} SOL, max per position ${Math.max(0, maxSolPerPosition).toFixed(4)} SOL.`);
+
+    if (maxSolPerPosition > 0.001 && cfg.maxBuysPerCycle > 0) {
+      const candidates = await fetchCandidates(cfg);
+      if (candidates.length > 0) {
+        const recs = await getTradeRecommendations(cfg, candidates, balance, maxSolPerPosition);
+        console.log("LLM recommendations:", recs);
+        await buyRecommendedTokens(runtime, cfg, connection, state, candidates, recs);
+      }
+    } else {
+      console.log("Not enough SOL to open new positions.");
+    }
+
+    console.log(
+      `Cycle done. Open positions: ${Object.keys(state.positions).length}, realized PnL ${state.realizedPnlSol.toFixed(4)} SOL` +
+        (cfg.live ? "" : `, paper balance ${state.paperSol.toFixed(4)} SOL`)
+    );
+    return true;
+  } finally {
+    cycleRunning = false;
+  }
 }
 
 const purchaseRecommendedTokensAction: Action = {
   name: "PURCHASE_RECOMMENDED_TOKENS",
   similes: ["GET_RECOMMENDED_TOKENS", "BUY_RECOMMENDED_TOKENS"],
   description:
-    "Fetch trending data from random BirdEye endpoints, buy with SOL, handle sells if needed, tweet stoically.",
+    "Runs one trading cycle: manage open positions, pick trending Solana tokens with an LLM and buy them (paper mode unless TRADING_MODE=live).",
 
-  validate: async (runtime: IAgentRuntime, message: Memory) => {
-    console.log("Message:", message);
-    return true;
-  },
+  validate: async (_runtime: IAgentRuntime, _message: Memory) => true,
 
-  handler: async (runtime: IAgentRuntime, message: Memory, state?: State) => {
+  handler: async (runtime: IAgentRuntime, _message: Memory, _state?: State) => {
     try {
-      const apiKey = runtime.getSetting("BIRDEYE_API_KEY") || "";
-      const walletAddress = runtime.getSetting("WALLET_PUBLIC_KEY") || "";
-      const openAiApiKey = runtime.getSetting("OPENAI_API_KEY") || "";
-
-      if (!apiKey || !walletAddress || !openAiApiKey) {
-        throw new Error("Missing API keys or Wallet Address in the application settings.");
-      }
-
-      const connection = new Connection("https://api.mainnet-beta.solana.com");
-      const sufficientFunds = await hasSufficientBalance(runtime, apiKey, walletAddress);
-      if (!sufficientFunds) {
-        console.log("Not enough funds. Attempting partial sells...");
-        await sellTokensIfNeeded(runtime);
-        const fundsNow = await hasSufficientBalance(runtime, apiKey, walletAddress);
-        if (!fundsNow) {
-          console.log("Still insufficient after sells. Exiting...");
-          return;
-        }
-      }
-
-      const lamportsBalance = await connection.getBalance(new PublicKey(walletAddress));
-      const solBalance = lamportsBalance / 1e9;
-      console.log(`Using wallet SOL balance of ${solBalance.toFixed(4)} in LLM prompt.`);
-
-      const trendingEndpoint = pickBirdEyeEndpoint();
-      console.log(`Chosen BirdEye endpoint: ${trendingEndpoint}`);
-      const trendingOptions = {
-        method: "GET",
-        headers: {
-          accept: "application/json",
-          "X-API-KEY": apiKey,
-          "x-chain": "solana",
-        },
-      };
-      await sleep(5000);
-      const trendingResponse = await fetch(trendingEndpoint, trendingOptions);
-      if (!trendingResponse.ok) {
-        throw new Error(`Trending API call failed with status: ${trendingResponse.status}`);
-      }
-      const trendingData = await trendingResponse.json();
-
-      const cryptoTokensJson: Record<string, { address: string }> = {};
-      if (trendingData?.data?.tokens?.length) {
-        for (const tkn of trendingData.data.tokens) {
-          cryptoTokensJson[tkn.symbol.toLowerCase()] = { address: tkn.address };
-        }
-      }
-      console.log("Trending Tokens for LLM Prompt:", cryptoTokensJson);
-
-      const recommendation = await getTradeRecommendation(
-        openAiApiKey,
-        cryptoTokensJson,
-        solBalance
-      );
-      const recommendationsResponse = recommendation.recommendations;
-      if (!recommendationsResponse || recommendationsResponse.length === 0) {
-        console.log("No trade recommendations available.");
-        return;
-      }
-      console.log("Trade Recommendations:", recommendationsResponse);
-
-      await buyRecommendedTokens(recommendationsResponse, runtime);
-      console.log("Performing a quick post-buy check for potential sells...");
-      await sellTokensIfNeeded(runtime);
-
-      console.log("Trade execution + any sells completed.");
-      return true;
+      return await runTradingCycle(runtime);
     } catch (error) {
-      console.error("Error in action handler:", error);
+      console.error("Error in trading cycle:", error);
       return false;
     }
   },
 
   examples: [
     [
-      {
-        user: "{{user1}}",
-        content: { text: "Can you purchase some recommended tokens for me?" },
-      },
+      { user: "{{user1}}", content: { text: "Run a trading cycle and buy any recommended tokens." } },
       {
         user: "{{user2}}",
-        content: {
-          text: "BirdEye data has been fetched, and trade recommendations are available. Now just purchased the tokens",
-          action: "PURCHASE_RECOMMENDED_TOKENS",
-        },
+        content: { text: "Running the trading cycle now.", action: "PURCHASE_RECOMMENDED_TOKENS" },
       },
     ],
   ],
