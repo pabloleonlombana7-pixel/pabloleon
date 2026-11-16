@@ -41,6 +41,10 @@ Candidate tokens come from DexScreener by default (free, no API key; pairs young
 
 Paper mode only needs `OPENAI_API_KEY`. Live mode also needs `SOLANA_PRIVATE_KEY` and `SOLANA_PUBLIC_KEY`, plus the `TWITTER_*` credentials if publishing is enabled.
 
+### Paper trading without the monorepo
+
+`paper-trader/` runs the same trading cycle in paper mode with only three npm dependencies; see `paper-trader/README.md`.
+
 ## Status
 
 Archived. Kept as an engineering reference; it is not maintained and should not be run with real funds without review.
