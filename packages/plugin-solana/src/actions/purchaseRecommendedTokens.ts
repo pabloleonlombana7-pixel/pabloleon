@@ -19,6 +19,8 @@ import * as path from "path";
  *   SOLANA_RPC_URL / RPC_URL        RPC endpoint (default: public mainnet)
  *   JUPITER_API_URL                 default https://lite-api.jup.ag/swap/v1
  *   TRADING_OPENAI_MODEL            default gpt-4o
+ *   TRADING_TOKEN_SOURCE            "dexscreener" (default, free, no key) or "birdeye"
+ *   TRADING_MIN_PAIR_AGE_HOURS      ignore pairs younger than this (default 24, DexScreener)
  *   TRADING_MAX_POSITION_FRACTION   max share of SOL balance per buy (default 0.2)
  *   TRADING_MAX_BUYS_PER_CYCLE      default 2
  *   TRADING_MIN_LIQUIDITY_USD       default 50000
@@ -59,6 +61,8 @@ interface IConfig {
   openAiApiKey: string;
   openAiModel: string;
   birdeyeApiKey: string;
+  tokenSource: "dexscreener" | "birdeye";
+  minPairAgeHours: number;
   maxPositionFraction: number;
   maxBuysPerCycle: number;
   minLiquidityUsd: number;
@@ -105,6 +109,9 @@ function loadConfig(runtime: IAgentRuntime): IConfig {
     openAiApiKey: runtime.getSetting("OPENAI_API_KEY") || "",
     openAiModel: runtime.getSetting("TRADING_OPENAI_MODEL") || "gpt-4o",
     birdeyeApiKey: runtime.getSetting("BIRDEYE_API_KEY") || "",
+    tokenSource:
+      (runtime.getSetting("TRADING_TOKEN_SOURCE") || "").toLowerCase() === "birdeye" ? "birdeye" : "dexscreener",
+    minPairAgeHours: numSetting(runtime, "TRADING_MIN_PAIR_AGE_HOURS", 24),
     maxPositionFraction: Math.min(Math.max(numSetting(runtime, "TRADING_MAX_POSITION_FRACTION", 0.2), 0), 1),
     maxBuysPerCycle: Math.max(0, Math.floor(numSetting(runtime, "TRADING_MAX_BUYS_PER_CYCLE", 2))),
     minLiquidityUsd: numSetting(runtime, "TRADING_MIN_LIQUIDITY_USD", 50_000),
@@ -307,7 +314,85 @@ async function postTweet(cfg: IConfig, state: ITradingState, content: string) {
 // Candidate selection
 // ---------------------------------------------------------------------------
 
+function passesFilters(cfg: IConfig, c: ICandidate): boolean {
+  return c.liquidityUsd >= cfg.minLiquidityUsd && c.volume24hUsd >= cfg.minVolumeUsd;
+}
+
 async function fetchCandidates(cfg: IConfig): Promise<ICandidate[]> {
+  return cfg.tokenSource === "birdeye" ? fetchBirdeyeCandidates(cfg) : fetchDexScreenerCandidates(cfg);
+}
+
+/**
+ * Free, keyless source: Solana tokens from DexScreener's latest profiles and top
+ * boosts, enriched with pair data. Liquidity and volume are summed over each
+ * token's pairs; pairs younger than TRADING_MIN_PAIR_AGE_HOURS are ignored.
+ */
+async function fetchDexScreenerCandidates(cfg: IConfig): Promise<ICandidate[]> {
+  const base = "https://api.dexscreener.com";
+  const getJson = async (url: string) => {
+    const r = await fetch(url, { headers: { accept: "application/json" } });
+    if (!r.ok) throw new Error(`DexScreener ${url} failed with status ${r.status}`);
+    return r.json();
+  };
+
+  const lists = await Promise.all([
+    getJson(`${base}/token-profiles/latest/v1`),
+    getJson(`${base}/token-boosts/top/v1`),
+  ]);
+  const addresses = [
+    ...new Set(
+      lists
+        .flat()
+        .filter((t: any) => t?.chainId === "solana" && t?.tokenAddress && t.tokenAddress !== SOL_MINT)
+        .map((t: any) => String(t.tokenAddress))
+    ),
+  ];
+
+  const minCreatedAt = Date.now() - cfg.minPairAgeHours * 3_600_000;
+  const byToken = new Map<string, ICandidate & { bestLiquidity: number }>();
+  for (let i = 0; i < addresses.length; i += 30) {
+    const pairs: any[] = await getJson(`${base}/tokens/v1/solana/${addresses.slice(i, i + 30).join(",")}`);
+    for (const p of pairs || []) {
+      const addr = p?.baseToken?.address;
+      if (!addr || !addresses.includes(addr)) continue;
+      if (!p.pairCreatedAt || p.pairCreatedAt > minCreatedAt) continue;
+      const liq = Number(p.liquidity?.usd || 0);
+      const vol = Number(p.volume?.h24 || 0);
+      const prev = byToken.get(addr);
+      if (!prev) {
+        byToken.set(addr, {
+          symbol: String(p.baseToken.symbol || "?"),
+          address: addr,
+          liquidityUsd: liq,
+          volume24hUsd: vol,
+          priceUsd: Number(p.priceUsd || 0),
+          rank: null,
+          bestLiquidity: liq,
+        });
+      } else {
+        prev.liquidityUsd += liq;
+        prev.volume24hUsd += vol;
+        if (liq > prev.bestLiquidity) {
+          prev.bestLiquidity = liq;
+          prev.priceUsd = Number(p.priceUsd || 0);
+        }
+      }
+    }
+  }
+
+  const candidates = [...byToken.values()]
+    .map(({ bestLiquidity: _b, ...c }) => c)
+    .filter((c) => passesFilters(cfg, c))
+    .sort((a, b) => b.liquidityUsd - a.liquidityUsd)
+    .slice(0, 20);
+  console.log(
+    `DexScreener: ${addresses.length} Solana tokens, ${byToken.size} with pairs older than ${cfg.minPairAgeHours}h, ` +
+      `${candidates.length} passed liquidity/volume filters.`
+  );
+  return candidates;
+}
+
+async function fetchBirdeyeCandidates(cfg: IConfig): Promise<ICandidate[]> {
   // Sorted descending so the most liquid / most traded trending tokens come first.
   const endpoints = [
     "https://public-api.birdeye.so/defi/token_trending?sort_by=rank&sort_type=asc&offset=0&limit=20",
@@ -329,9 +414,9 @@ async function fetchCandidates(cfg: IConfig): Promise<ICandidate[]> {
       priceUsd: Number(t.price || 0),
       rank: t.rank ?? null,
     }))
-    .filter((c) => c.liquidityUsd >= cfg.minLiquidityUsd && c.volume24hUsd >= cfg.minVolumeUsd);
+    .filter((c) => passesFilters(cfg, c));
 
-  console.log(`${candidates.length}/${tokens.length} tokens passed liquidity/volume filters.`);
+  console.log(`Birdeye: ${candidates.length}/${tokens.length} tokens passed liquidity/volume filters.`);
   return candidates;
 }
 
@@ -569,8 +654,11 @@ export async function runTradingCycle(runtime: IAgentRuntime, opts: { ignoreCool
   cycleRunning = true;
   try {
     const cfg = loadConfig(runtime);
-    if (!cfg.birdeyeApiKey || !cfg.openAiApiKey) {
-      throw new Error("BIRDEYE_API_KEY and OPENAI_API_KEY are required.");
+    if (!cfg.openAiApiKey) {
+      throw new Error("OPENAI_API_KEY is required.");
+    }
+    if (cfg.tokenSource === "birdeye" && !cfg.birdeyeApiKey) {
+      throw new Error("BIRDEYE_API_KEY is required when TRADING_TOKEN_SOURCE=birdeye.");
     }
     const state = loadState(cfg);
     const sinceLast = Date.now() - state.lastCycleAt;
