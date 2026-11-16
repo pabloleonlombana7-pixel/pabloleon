@@ -33,6 +33,10 @@ pnpm build
 pnpm start --character=characters/modern_stoic.character.json
 ```
 
+The agent starts in **paper mode**: it reads real market data and real Jupiter quotes, but never signs or sends a transaction and never tweets. Trades are simulated against a virtual balance (`TRADING_PAPER_SOL`, default 1 SOL) and state is saved to `data/stoic-trading-paper.json`. Set `TRADING_MODE=live` only after you have reviewed the code and are prepared to lose the funds in the wallet.
+
+Risk and loop settings (see the top of `purchaseRecommendedTokens.ts`): `TRADING_MAX_POSITION_FRACTION` (0.2), `TRADING_MAX_BUYS_PER_CYCLE` (2), `TRADING_MIN_LIQUIDITY_USD` (50000), `TRADING_MIN_VOLUME_USD` (100000), `TRADING_SLIPPAGE_BPS` (100), `TRADING_SOL_RESERVE` (0.02), `TRADING_COOLDOWN_MINUTES` (60), `SOLANA_RPC_URL`, `JUPITER_API_URL`, `TRADING_OPENAI_MODEL`, `TRADING_TWEETS_ENABLED`.
+
 Required environment variables include `SOLANA_PRIVATE_KEY`, `SOLANA_PUBLIC_KEY`, `OPENAI_API_KEY`, `BIRDEYE_API_KEY`, `HELIUS_API_KEY`, and the `TWITTER_*` credentials if publishing is enabled.
 
 ## Status

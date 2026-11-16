@@ -1,23 +1,16 @@
 import { Provider, IAgentRuntime, Memory, State } from "@elizaos/core";
-import tradingStartAction from "../actions/tradingStartAction";
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-const tradingStartProvider: Provider = {
-    get: async (runtime: IAgentRuntime, message: Memory, state?: State) => {
+import { startTradingLoop } from "../actions/mainTradingActions";
 
-        console.log("Starting Trading Provider of Modern Stoic AI Agent");
+// elizaOS calls providers every time it composes state (i.e. on every message),
+// so this only starts the loop once and returns immediately.
+const tradingStartProvider: Provider = {
+    get: async (runtime: IAgentRuntime, _message: Memory, _state?: State) => {
         try {
-            await sleep(10000);
-            // Attempt to execute the trading start action
-            await tradingStartAction.handler(runtime, message);
-            // Process the result as needed
+            startTradingLoop(runtime);
         } catch (error) {
-            // Handle any errors that occur during the trading action
-            console.error('An error occurred during the trading action:', error);
-            // Implement additional error handling logic if necessary
+            console.error("Could not start the trading loop:", error);
         }
-        return "Started Trading Provider of Modern Stoic AI Agent";
+        return "";
     },
 };
 

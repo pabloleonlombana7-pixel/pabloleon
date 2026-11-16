@@ -1,1 +1,4 @@
 .env
+
+# trading agent state
+data/stoic-trading-*.json*
